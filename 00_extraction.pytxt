@@ -1,0 +1,348 @@
+# 00_extraction.py
+#
+# Sections:
+#   I.    Configuration
+#   II.   Code lists
+#   III.  Helpers
+#   IV.   Column specifications
+#   V.    SEER
+#   VI.   MedPAR
+#   VII.  Diagnosis file
+#   VIII. Procedures file
+#   IX.   Treatment file
+#   X.    MBSF
+#
+# Last edited: 2026-09-01
+
+from pathlib import Path
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# =============================================================================
+# I. Configuration
+# =============================================================================
+ROOT   = Path("./SEER-Medicare_Parquet")
+OUTPUT = Path("output/extracted")
+OUTPUT.mkdir(parents=True, exist_ok=True)
+
+YEARS = list(range(2010, 2023))
+
+# =============================================================================
+# II. Code lists
+# =============================================================================
+LUNG_ICD9         = [f'162{i}' for i in range(2, 10)]
+LUNG_ICD10_PREFIX = 'C34'
+
+LUNG_SURGERY_ICD9 = [
+    '3220','3229','3230','3239','323','324','3241','3249','325','3250','3259','329'
+]
+LUNG_SURGERY_ICD10 = [
+    '0BBC4ZX','0BBC4ZZ','0BBC0ZX','0BBC0ZZ','0BBD4ZX','0BBD4ZZ','0BBD0ZX','0BBD0ZZ',
+    '0BBF4ZX','0BBF4ZZ','0BBF0ZX','0BBF0ZZ','0BBG4ZX','0BBG4ZZ','0BBG0ZX','0BBG0ZZ',
+    '0BBH4ZX','0BBH4ZZ','0BBH0ZX','0BBH0ZZ','0BBJ4ZX','0BBJ4ZZ','0BBJ0ZX','0BBJ0ZZ',
+    '0BBK4ZX','0BBK4ZZ','0BBK0ZX','0BBK0ZZ','0BBL4ZX','0BBL4ZZ','0BBL0ZX','0BBL0ZZ',
+    '0BTC4ZZ','0BTC0ZZ','0BTD4ZZ','0BTD0ZZ','0BTF4ZZ','0BTF0ZZ','0BTG4ZZ','0BTG0ZZ',
+    '0BTH4ZZ','0BTH0ZZ','0BTJ4ZZ','0BTJ0ZZ','0BBM4ZX','0BBM4ZZ','0BBM0ZX','0BBM0ZZ',
+    '0BTM4ZZ','0BTM0ZZ','0BTK4ZZ','0BTK0ZZ','0BTL4ZZ','0BTL0ZZ',
+]
+LUNG_SURGERY_ALL = set(LUNG_SURGERY_ICD9 + LUNG_SURGERY_ICD10)
+
+# SBRT dates feed lung_treatment.parquet, which the SCLC scripts do not read
+SBRT_CPT = {'77373', 'G0173', 'G0251', 'G0339', 'G0340', '61793', '0082T', '77435'}
+
+
+# =============================================================================
+# III. Helpers
+# =============================================================================
+
+def outpat_folder(year):
+    return ROOT / ("Outpatient" if year <= 2018 else "Outpatient (2019-2022)")
+
+
+def is_lung(s):
+    s = s.astype(str).fillna('')
+    return s.isin(LUNG_ICD9) | s.str.startswith(LUNG_ICD10_PREFIX)
+
+
+def get_surgery_date(df, code_cols, date_cols, target_codes):
+    result = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns]')
+    for cc, dc in zip(code_cols, date_cols):
+        if cc not in df.columns or dc not in df.columns:
+            continue
+        mask = df[cc].isin(target_codes) & result.isna()
+        if mask.any():
+            result[mask] = pd.to_datetime(df.loc[mask, dc], errors='coerce')
+    return result
+
+
+def append_parquet(path, df):
+    """Append df to a parquet file on disk."""
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if path.exists():
+        existing = pq.read_table(path)
+        pq.write_table(pa.concat_tables([existing, table], promote_options='default'), path)
+    else:
+        pq.write_table(table, path)
+
+
+# =============================================================================
+# IV. Column specifications
+# =============================================================================
+MEDPAR_PCODE_COLS = [f'SRGCL_PRCDR_{i}_CD'       for i in range(1, 26)]
+MEDPAR_PDATE_COLS = [f'SRGCL_PRCDR_PRFRM_{i}_DT' for i in range(1, 26)]
+MEDPAR_DGNS_COLS  = [f'DGNS_{i}_CD'               for i in range(1, 26)]
+MEDPAR_COLS = ['PATIENT_ID','ADMSN_DT','DSCHRG_DT'] + MEDPAR_DGNS_COLS + MEDPAR_PCODE_COLS + MEDPAR_PDATE_COLS
+
+NCHBASE_DGNS_COLS = ['PRNCPAL_DGNS_CD'] + [f'ICD_DGNS_CD{i}' for i in range(1, 13)]
+NCHBASE_E_COLS    = [f'ICD_DGNS_E_CD{i}' for i in range(1, 13)]
+NCHBASE_COLS      = ['PATIENT_ID','CLM_ID','CLM_FROM_DT','CLM_THRU_DT'] + NCHBASE_DGNS_COLS
+
+NCHLINE_COLS = ['PATIENT_ID','CLM_ID','CLM_THRU_DT','HCPCS_CD','LINE_ICD_DGNS_CD']
+
+OUTPAT_DGNS_COLS = ['PRNCPAL_DGNS_CD'] + [f'ICD_DGNS_CD{i}' for i in range(1, 26)]
+OUTPAT_E_COLS    = ['FST_DGNS_E_CD'] + [f'ICD_DGNS_E_CD{i}' for i in range(1, 13)]
+OUTPAT_BASE_COLS = ['patient_id','CLM_ID','CLM_FROM_DT','CLM_THRU_DT'] + OUTPAT_DGNS_COLS + OUTPAT_E_COLS
+OUTPAT_REV_COLS  = ['PATIENT_ID','CLM_ID','CLM_THRU_DT','HCPCS_CD']
+
+DME_LINE_COLS = ['PATIENT_ID','CLM_ID','CLM_THRU_DT','HCPCS_CD']
+
+HMO_COLS   = [f'HMO_IND_{m:02d}'               for m in range(1, 13)]
+BUYIN_COLS = [f'MDCR_ENTLMT_BUYIN_IND_{m:02d}'  for m in range(1, 13)]
+MBSF_COLS  = ['patient_id','BENE_ENROLLMT_REF_YR','BENE_BIRTH_DT','BENE_DEATH_DT',
+              'VALID_DEATH_DT_SW'] + HMO_COLS + BUYIN_COLS
+
+SEER_COLS = [
+    'PATIENT_ID','PRIMARY_SITE','YEAR_OF_DIAGNOSIS','MONTH_OF_DIAGNOSIS','SEQUENCE_NUMBER',
+    'HISTOLOGIC_TYPE_ICD_O_3','BEHAVIOR_CODE_ICD_O_3','DIAGNOSTIC_CONFIRMATION',
+    'SEX','RACE_RECODE_WHITE_BLACK_OTHER','AGERECODEWITHSINGLE_AGES_AND_90',
+    'MARITAL_STATUS_AT_DIAGNOSIS','SEERCAUSESPECIFICDEATHCLASSIFIC','SEEROTHERCAUSEOFDEATHCLASSIFICA',
+    'RX_SUMM_SURG_PRIM_SITE_1998','SURVIVAL_MONTHS',
+    'CS_TUMOR_SIZE_2004_2015','TUMOR_SIZE_SUMMARY_2016',
+    'DERIVED_AJCC_T_7TH_ED_2010_2015','DERIVED_AJCC_N_7TH_ED_2010_2015','DERIVED_AJCC_M_7TH_ED_2010_2015',
+    'DERIVEDSEERCOMBINED_T_2016_2017','DERIVEDSEERCOMBINED_N_2016_2017','DERIVEDSEERCOMBINED_M_2016_2017',
+    'DERIVED_EOD_2018_T_2018','DERIVED_EOD_2018_N_2018','DERIVED_EOD_2018_M_2018',
+    'DERIVEDSEERCOMBINEDTSRC20162017','DERIVEDSEERCOMBINEDNSRC20162017',
+    # registry stage group by era: AJCC 7th (2010-2015), SEER Combined (2016-2017), EOD 2018 (2018+)
+    'DERIVEDAJCCSTAGEGROUP7THED20102',
+    'DERIVEDSEERCMBSTG_GRP_2016_2017',
+    'DERIVEDEOD2018_STAGE_GROUP_2018',
+
+    'CHEMOTHERAPY_RECODE_YES_NO_UNK','RADIATION_RECODE',
+
+    "COMBINED_SUMMARY_STAGE_2004",
+    "RURAL_URBAN_CONTINUUM_CODE",
+    "LATERALITY",
+    "SEER_REGISTRY",
+    "MEDIANHOUSEHOLDINCOMEINFLATION",
+    "YOST_ACS_2013_2017_QUINTILE",
+    "STATE"
+]
+
+
+# =============================================================================
+# V. SEER
+# =============================================================================
+print("Loading SEER...")
+seer = pd.read_parquet(ROOT / "seer_lung_cancer.parquet", columns=SEER_COLS)
+seer = seer[seer['PRIMARY_SITE'].astype(str).str.startswith(('162', 'C34'))]
+seer['YEAR_OF_DIAGNOSIS'] = pd.to_numeric(seer['YEAR_OF_DIAGNOSIS'], errors='coerce')
+# first primary per patient (lowest sequence number), selected before the year restriction
+seer = seer.sort_values('SEQUENCE_NUMBER').drop_duplicates('PATIENT_ID', keep='first')
+seer = seer[(seer['YEAR_OF_DIAGNOSIS'] >= 2010) & (seer['YEAR_OF_DIAGNOSIS'] <= 2021)]
+print(f"  Lung cancer patients (first primary 2010-2021): {len(seer):,}")
+seer.to_parquet(OUTPUT / "seer_lung.parquet", index=False)
+PIDS = set(seer['PATIENT_ID'])
+print(f"  Unique PIDs: {len(PIDS):,}")
+print(f"  Diagnosis year range: {seer['YEAR_OF_DIAGNOSIS'].min()} - {seer['YEAR_OF_DIAGNOSIS'].max()}")
+
+# =============================================================================
+# VI. MedPAR
+# =============================================================================
+print("\nLoading MedPAR...")
+frames = []
+for year in YEARS:
+    fn = ROOT / f"medpar{year}.parquet"
+    if not fn.exists(): continue
+    df = pd.read_parquet(fn, columns=MEDPAR_COLS)
+    df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+    if df.empty: continue
+    df['lung_resection_date'] = get_surgery_date(df, MEDPAR_PCODE_COLS, MEDPAR_PDATE_COLS, LUNG_SURGERY_ALL)
+    df['dataset_year'] = year
+    frames.append(df)
+
+medpar = pd.concat(frames, ignore_index=True)
+medpar.to_parquet(OUTPUT / "medpar.parquet", index=False)
+print(f"  MedPAR total: {len(medpar):,}")
+
+# =============================================================================
+# VII. Diagnosis file
+# =============================================================================
+print("\nBuilding lung_diagnosis...")
+dx_out = OUTPUT / "lung_diagnosis.parquet"
+dx_out.unlink(missing_ok=True)
+
+medpar_dx = (medpar
+    .rename(columns={f'DGNS_{i}_CD': f'ICD_DGNS_CD{i}' for i in range(1, 26)})
+    .rename(columns={'ADMSN_DT': 'CLM_FROM_DT', 'DSCHRG_DT': 'CLM_THRU_DT'}))
+dx_cols = [c for c in medpar_dx.columns if c.startswith('ICD_DGNS_CD') or c == 'PRNCPAL_DGNS_CD']
+chunk = medpar_dx[['PATIENT_ID','CLM_FROM_DT','CLM_THRU_DT'] + dx_cols].assign(source='medpar').copy()
+for c in ['CLM_FROM_DT','CLM_THRU_DT']:
+    chunk[c] = pd.to_datetime(chunk[c], errors='coerce')
+chunk['CLM_THRU_DT'] = chunk['CLM_THRU_DT'].fillna(chunk['CLM_FROM_DT'])
+append_parquet(dx_out, chunk)
+print(f"  Added MedPAR: {len(chunk):,}")
+
+for year in YEARS:
+    fn = ROOT / "NCH" / f"nch{year}" / f"nchbase{year}.parquet"
+    if fn.exists():
+        all_cols = pq.read_schema(fn).names
+        keep_cols = [c for c in NCHBASE_COLS + NCHBASE_E_COLS if c in all_cols]
+        df = pd.read_parquet(fn, columns=keep_cols)
+        df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+        for c in ['CLM_FROM_DT','CLM_THRU_DT']:
+            df[c] = pd.to_datetime(df[c], errors='coerce')
+        df['CLM_THRU_DT'] = df['CLM_THRU_DT'].fillna(df['CLM_FROM_DT'])
+        dx_cols = [c for c in df.columns if c.startswith('ICD_DGNS_CD') or c == 'PRNCPAL_DGNS_CD']
+        chunk = df[['PATIENT_ID','CLM_FROM_DT','CLM_THRU_DT'] + dx_cols].assign(source='carrierbase')
+        append_parquet(dx_out, chunk)
+        print(f"  {year} NCH base: {len(chunk):,}")
+
+    fn = outpat_folder(year) / f"outpat_base{year}.parquet"
+    if fn.exists():
+        all_cols = pq.read_schema(fn).names
+        keep_cols = [c for c in OUTPAT_BASE_COLS if c in all_cols]
+        df = pd.read_parquet(fn, columns=keep_cols)
+        df = df.rename(columns={'patient_id': 'PATIENT_ID'})
+        df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+        for c in ['CLM_FROM_DT','CLM_THRU_DT']:
+            df[c] = pd.to_datetime(df[c], errors='coerce')
+        df['CLM_THRU_DT'] = df['CLM_THRU_DT'].fillna(df['CLM_FROM_DT'])
+        dx_cols = [c for c in df.columns if 'ICD_DGNS' in c or c == 'PRNCPAL_DGNS_CD' or c == 'FST_DGNS_E_CD']
+        chunk = df[['PATIENT_ID','CLM_FROM_DT','CLM_THRU_DT'] + dx_cols].assign(source='outpat')
+        append_parquet(dx_out, chunk)
+        print(f"  {year} outpat base: {len(chunk):,}")
+
+# =============================================================================
+# VIII. Procedures file
+# =============================================================================
+print("\nBuilding lung_procedures...")
+proc_out = OUTPUT / "lung_procedures.parquet"
+proc_out.unlink(missing_ok=True)
+sbrt_frames = []
+
+# inpatient chest CT rows carry the synthetic HCPCS value 71260 for the chest-CT studies
+CT_CHEST_ICD9_PROC = {"8741"}
+CT_CHEST_ICD10_PCS_PREFIXES = {"BW24", "BW21", "BW25", "BD24"}
+
+for year in YEARS:
+    fn = ROOT / f"medpar{year}.parquet"
+    if not fn.exists():
+        continue
+    pcols = [f'SRGCL_PRCDR_{i}_CD' for i in range(1, 26)]
+    dcols = [f'SRGCL_PRCDR_PRFRM_{i}_DT' for i in range(1, 26)]
+    df = pd.read_parquet(fn, columns=['PATIENT_ID'] + pcols + dcols)
+    df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+    if df.empty:
+        continue
+    rows = []
+    for pc, dc in zip(pcols, dcols):
+        if pc not in df.columns or dc not in df.columns:
+            continue
+        sub = df[['PATIENT_ID', pc, dc]].copy()
+        sub[pc] = sub[pc].astype(str).str.strip()
+        mask = sub[pc].isin(CT_CHEST_ICD9_PROC)
+        for prefix in CT_CHEST_ICD10_PCS_PREFIXES:
+            mask = mask | sub[pc].str.startswith(prefix)
+        sub = sub[mask].copy()
+        if sub.empty:
+            continue
+        sub['HCPCS_CD'] = '71260'
+        sub['CLM_THRU_DT'] = pd.to_datetime(sub[dc], errors='coerce')
+        rows.append(sub[['PATIENT_ID', 'HCPCS_CD', 'CLM_THRU_DT']].dropna(subset=['CLM_THRU_DT']))
+    if rows:
+        medpar_procs = pd.concat(rows, ignore_index=True)
+        append_parquet(proc_out, medpar_procs)
+        print(f"  {year} MedPAR inpatient CT: {len(medpar_procs):,}")
+
+for year in YEARS:
+    fn = ROOT / "NCH" / f"nch{year}" / f"nchline{year}.parquet"
+    if fn.exists():
+        df = pd.read_parquet(fn, columns=NCHLINE_COLS)
+        df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+        df['CLM_THRU_DT'] = pd.to_datetime(df['CLM_THRU_DT'], errors='coerce')
+        df['valid_dx'] = is_lung(df['LINE_ICD_DGNS_CD'])
+        df['sbrt']     = df['HCPCS_CD'].isin(SBRT_CPT) & df['valid_dx']
+        sbrt_nch = df[df['sbrt']][['PATIENT_ID','CLM_THRU_DT']].rename(columns={'CLM_THRU_DT': 'sbrt_date'})
+        if not sbrt_nch.empty: sbrt_frames.append(sbrt_nch)
+        append_parquet(proc_out, df[['PATIENT_ID','HCPCS_CD','CLM_THRU_DT']])
+        print(f"  {year} NCH line: {len(df):,}")
+
+    fn = outpat_folder(year) / f"outpat_revenue{year}.parquet"
+    if fn.exists():
+        all_cols = pq.read_schema(fn).names
+        keep_cols = [c for c in OUTPAT_REV_COLS + ['REV_CNTR'] if c in all_cols]
+        df = pd.read_parquet(fn, columns=keep_cols)
+        df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+        df['CLM_THRU_DT'] = pd.to_datetime(df['CLM_THRU_DT'], errors='coerce')
+        df['sbrt'] = df['HCPCS_CD'].isin(SBRT_CPT)
+        sbrt_out = df[df['sbrt']][['PATIENT_ID','CLM_THRU_DT']].rename(columns={'CLM_THRU_DT': 'sbrt_date'})
+        if not sbrt_out.empty: sbrt_frames.append(sbrt_out)
+
+        proc_df = df[['PATIENT_ID','HCPCS_CD','CLM_THRU_DT']].copy()
+
+        # revenue-centre CT (0350, 0352) rows are tagged 71260_REV, which no SCLC code list contains
+        if 'REV_CNTR' in df.columns:
+            df['rev_str'] = df['REV_CNTR'].astype(str).str.strip().str.zfill(4)
+            ct_by_rev = df[df['rev_str'].isin(['0350', '0352'])][['PATIENT_ID','CLM_THRU_DT']].copy()
+            ct_by_rev['HCPCS_CD'] = '71260_REV'
+            proc_df = pd.concat([proc_df, ct_by_rev], ignore_index=True)
+
+        append_parquet(proc_out, proc_df)
+        print(f"  {year} outpat revenue: {len(proc_df):,}")
+
+    fn = ROOT / "DME" / f"dme_line{year}.parquet"
+    if fn.exists():
+        df = pd.read_parquet(fn, columns=DME_LINE_COLS)
+        df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+        df['CLM_THRU_DT'] = pd.to_datetime(df['CLM_THRU_DT'], errors='coerce')
+        append_parquet(proc_out, df[['PATIENT_ID','HCPCS_CD','CLM_THRU_DT']])
+        print(f"  {year} DME line: {len(df):,}")
+
+# =============================================================================
+# IX. Treatment file
+# =============================================================================
+print("\nBuilding treatment file...")
+medpar_tx = (medpar[['PATIENT_ID','lung_resection_date']]
+             .dropna(subset=['lung_resection_date'])
+             .rename(columns={'lung_resection_date': 'procedure_date'})
+             .assign(procedure_type='lung_resection'))
+
+sbrt_tx = (pd.concat(sbrt_frames, ignore_index=True) if sbrt_frames
+           else pd.DataFrame(columns=['PATIENT_ID','sbrt_date']))
+sbrt_tx = sbrt_tx.rename(columns={'sbrt_date': 'procedure_date'}).assign(procedure_type='SBRT')
+
+lung_treatment = pd.concat([medpar_tx, sbrt_tx], ignore_index=True)
+lung_treatment.to_parquet(OUTPUT / "lung_treatment.parquet", index=False)
+print(f"  Treatment rows: {len(lung_treatment):,}")
+
+# =============================================================================
+# X. MBSF
+# =============================================================================
+print("\nLoading MBSF...")
+frames = []
+for year in YEARS:
+    fn = ROOT / f"mbsf_abcd{year}.parquet"
+    if not fn.exists(): continue
+    df = pd.read_parquet(fn, columns=MBSF_COLS)
+    df = df.rename(columns={'patient_id': 'PATIENT_ID'})
+    df = df[df['PATIENT_ID'].isin(PIDS)].copy()
+    if df.empty: continue
+    df['dataset_year'] = year
+    frames.append(df)
+
+mbsf = pd.concat(frames, ignore_index=True)
+mbsf.to_parquet(OUTPUT / "mbsf.parquet", index=False)
+print(f"  MBSF total: {len(mbsf):,}")
+
+print("\nExtraction complete.")
